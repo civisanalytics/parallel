@@ -30,6 +30,14 @@ Parallel.each(['a','b','c']){|one_letter| ... }
 ```
 or `each_with_index` or `map_with_index`
 
+Produce one item at a time with `lambda` (anything that responds to `.call`) or `Queue`.
+
+```Ruby
+items = [1,2,3]
+Parallel.each(lambda{ items.pop || Parallel::Stop }){|number| ... }
+```
+
+
 Processes/Threads are workers, they grab the next piece of work when they finish.
 
 ### Processes
@@ -46,17 +54,25 @@ Processes/Threads are workers, they grab the next piece of work when they finish
 
 ### ActiveRecord
 
-Try either of those to get working parallel AR
+Try any of those to get working parallel AR
 
 ```Ruby
+# reproducibly fixes things (spec/cases/map_with_ar.rb)
+Parallel.each(User.all, :in_processes => 8) do |user|
+  user.update_attribute(:some_attribute, some_value)
+end
+User.connection.reconnect!
+
+# maybe helps: explicitly use connection pool
 Parallel.each(User.all, :in_threads => 8) do |user|
   ActiveRecord::Base.connection_pool.with_connection do
     user.update_attribute(:some_attribute, some_value)
   end
 end
 
+# maybe helps: reconnect once inside every fork
 Parallel.each(User.all, :in_processes => 8) do |user|
-  ActiveRecord::Base.connection.reconnect!
+  @reconnected ||= User.connection.reconnect! || true
   user.update_attribute(:some_attribute, some_value)
 end
 ```
@@ -65,20 +81,39 @@ end
 
 ```Ruby
 Parallel.map(User.all) do |user|
-  raise Parallel::Break # -> stop all execution
+  raise Parallel::Break # -> stops after all current items are finished
+end
+```
+
+### Kill
+
+Only use if whatever is executing in the sub-command is safe to kill at any point
+
+```
+Parallel.map([1,2,3]) do |x|
+  raise Parallel::Kill if x == 1# -> stop all sub-processes, killing them instantly
+  sleep 100
 end
 ```
 
 ### Progress / ETA
 
-```Bash
-gem install ruby-progressbar
+```Ruby
+# gem install ruby-progressbar
+
+Parallel.map(1..50, :progress => "Doing stuff") { sleep 1 }
+
+# Doing stuff | ETA: 00:00:02 | ====================               | Time: 00:00:10
 ```
 
+Use `:finish` or `:start` hook to get progress information.
+ - `:start` has item and index
+ - `:finish` has item, index, result
+
+They are called on the main process and protected with a mutex.
+
 ```Ruby
-require 'ruby-progressbar'
-progress = ProgressBar.create(:title => "The Progress", :total => 100)
-Parallel.map(1..100, :finish => lambda { |item, i| progress.increment }) { sleep 1 }
+Parallel.map(1..100, :finish => lambda { |item, i, result| ... do something ... }) { sleep 1 }
 ```
 
 Tips
@@ -87,7 +122,7 @@ Tips
 
 TODO
 ====
- - JRuby / Windows support <-> possible ?
+ - Replace Signal trapping with simple `rescue Interrupt` handler
 
 Authors
 =======
@@ -112,6 +147,9 @@ Authors
  - [Joachim](https://github.com/jmozmoz)
  - [yaoguai](https://github.com/yaoguai)
  - [Bartosz Dziewoński](https://github.com/MatmaRex)
+ - [yaoguai](https://github.com/yaoguai)
+ - [Guillaume Hain](https://github.com/zedtux)
+ - [Adam Wróbel](https://github.com/amw)
 
 [Michael Grosser](http://grosser.it)<br/>
 michael@grosser.it<br/>

@@ -1,13 +1,22 @@
-require 'thread' # to get Thread.exclusive
 require 'rbconfig'
 require 'parallel/version'
+require 'parallel/processor_count'
 
 module Parallel
-  class DeadWorker < Exception
+  extend Parallel::ProcessorCount
+
+  class DeadWorker < StandardError
   end
 
-  class Break < Exception
+  class Break < StandardError
   end
+
+  class Kill < StandardError
+  end
+
+  Stop = Object.new
+
+  INTERRUPT_SIGNAL = :SIGINT
 
   class ExceptionWrapper
     attr_reader :exception
@@ -23,6 +32,7 @@ module Parallel
 
   class Worker
     attr_reader :pid, :read, :write
+    attr_accessor :thread
     def initialize(read, write, pid)
       @read, @write, @pid = read, write, pid
     end
@@ -38,9 +48,9 @@ module Parallel
       # process died
     end
 
-    def work(index)
+    def work(data)
       begin
-        Marshal.dump(index, write)
+        Marshal.dump(data, write)
       rescue Errno::EPIPE
         raise DeadWorker
       end
@@ -48,13 +58,73 @@ module Parallel
       begin
         Marshal.load(read)
       rescue EOFError
-        raise Parallel::DeadWorker
+        raise DeadWorker
       end
     end
   end
 
+  class ItemWrapper
+    def initialize(array, mutex)
+      @lambda = (array.respond_to?(:call) && array) || queue_wrapper(array)
+      @items = array.to_a unless @lambda # turn Range and other Enumerable-s into an Array
+      @mutex = mutex
+      @index = -1
+    end
+
+    def producer?
+      @lambda
+    end
+
+    def each_with_index(&block)
+      if producer?
+        loop do
+          item, index = self.next
+          break unless index
+          yield(item, index)
+        end
+      else
+        @items.each_with_index(&block)
+      end
+    end
+
+    def next
+      if producer?
+        # - index and item stay in sync
+        # - do not call lambda after it has returned Stop
+        item, index = @mutex.synchronize do
+          return if @stopped
+          item = @lambda.call
+          @stopped = (item == Parallel::Stop)
+          return if @stopped
+          [item, @index += 1]
+        end
+      else
+        index = @mutex.synchronize { @index += 1 }
+        return if index >= size
+        item = @items[index]
+      end
+      [item, index]
+    end
+
+    def size
+      @items.size
+    end
+
+    def pack(item, index)
+      producer? ? [item, index] : index
+    end
+
+    def unpack(data)
+      producer? ? data : [@items[data], data]
+    end
+
+    def queue_wrapper(array)
+      array.respond_to?(:num_waiting) && array.respond_to?(:pop) && lambda { array.pop(false) }
+    end
+  end
+
   class << self
-    def in_threads(options={:count => 2, :kill_on_ctrl_c => true})
+    def in_threads(options={:count => 2, :kill_on_interrupt_signal => false})
       count, options = extract_count_from_options(options)
 
       out = []
@@ -66,7 +136,7 @@ module Parallel
         end
       end
 
-      kill_on_ctrl_c(threads, options[:kill_on_ctrl_c]) { wait_for_threads(threads) }
+      kill_on_ctrl_c(threads, options) { wait_for_threads(threads) }
 
       out
     end
@@ -87,26 +157,37 @@ module Parallel
     end
 
     def map(array, options = {}, &block)
-      array = array.to_a # turn Range and other Enumerable-s into an Array
-      if options[:kill_on_ctrl_c].nil? then
-        options[:kill_on_ctrl_c] = true
-      end
+      options[:mutex] = Mutex.new
 
-      if options[:in_threads]
+      if RUBY_PLATFORM =~ /java/ and not options[:in_processes]
+        method = :in_threads
+        size = options[method] || processor_count
+      elsif options[:in_threads]
         method = :in_threads
         size = options[method]
       else
         method = :in_processes
-        size = options[method] || processor_count
+        if Process.respond_to?(:fork)
+          size = options[method] || processor_count
+        else
+          $stderr.puts "Warning: Process.fork is not supported by this Ruby"
+          size = 0
+        end
       end
-      size = [array.size, size].min
 
-      return work_direct(array, options, &block) if size == 0
+      items = ItemWrapper.new(array, options[:mutex])
 
-      if method == :in_threads
-        work_in_threads(array, options.merge(:count => size), &block)
+      size = [items.producer? ? size : items.size, size].min
+
+      options[:return_results] = (options[:preserve_results] != false || !!options[:finish])
+      add_progress_bar!(items, options)
+
+      if size == 0
+        work_direct(items, options, &block)
+      elsif method == :in_threads
+        work_in_threads(items, options.merge(:count => size), &block)
       else
-        work_in_processes(array, options.merge(:count => size), &block)
+        work_in_processes(items, options.merge(:count => size), &block)
       end
     end
 
@@ -114,85 +195,52 @@ module Parallel
       map(array, options.merge(:with_index => true), &block)
     end
 
-    def processor_count
-      @processor_count ||= case RbConfig::CONFIG['host_os']
-      when /darwin9/
-        `hwprefs cpu_count`.to_i
-      when /darwin/
-        (hwprefs_available? ? `hwprefs thread_count` : `sysctl -n hw.ncpu`).to_i
-      when /linux|cygwin/
-        `grep -c ^processor /proc/cpuinfo`.to_i
-      when /(net|open|free)bsd/
-        `sysctl -n hw.ncpu`.to_i
-      when /mswin|mingw/
-        require 'win32ole'
-        wmi = WIN32OLE.connect("winmgmts://")
-        cpu = wmi.ExecQuery("select NumberOfLogicalProcessors from Win32_Processor")
-        cpu.to_enum.first.NumberOfLogicalProcessors
-      when /solaris2/
-        `psrinfo -p`.to_i # this is physical cpus afaik
-      else
-        $stderr.puts "Unknown architecture ( #{RbConfig::CONFIG["host_os"]} ) assuming one processor."
-        1
-      end
-    end
-
-    def physical_processor_count
-      @physical_processor_count ||= begin
-        ppc = case RbConfig::CONFIG['host_os']
-        when /darwin1/, /freebsd/
-          `sysctl -n hw.physicalcpu`.to_i
-        when /linux/
-          cores_per_physical = `grep cores /proc/cpuinfo`[/\d+/].to_i
-          physicals = `grep 'physical id' /proc/cpuinfo |sort|uniq|wc -l`.to_i
-          physicals * cores_per_physical
-        when /mswin|mingw/
-          require 'win32ole'
-          wmi = WIN32OLE.connect("winmgmts://")
-          cpu = wmi.ExecQuery("select NumberOfProcessors from Win32_Processor")
-          cpu.to_enum.first.NumberOfProcessors
-        else
-          processor_count
-        end
-        # fall back to logical count if physical info is invalid
-        ppc > 0 ? ppc : processor_count
-      end
-    end
-
     private
 
-    def work_direct(array, options)
+    def add_progress_bar!(items, options)
+      if title = options[:progress]
+        raise "Progressbar and producers don't mix" if items.producer?
+        require 'ruby-progressbar'
+        progress = ProgressBar.create(
+          :title => title,
+          :total => items.size,
+          :format => '%t |%E | %B | %a'
+        )
+        old_finish = options[:finish]
+        options[:finish] = lambda do |item, i, result|
+          old_finish.call(item, i, result) if old_finish
+          progress.increment
+        end
+      end
+    end
+
+
+    def work_direct(items, options)
       results = []
-      array.each_with_index do |e,i|
+      items.each_with_index do |e,i|
         results << (options[:with_index] ? yield(e,i) : yield(e))
       end
       results
     end
 
-    def hwprefs_available?
-      `which hwprefs` != ''
-    end
-
     def work_in_threads(items, options, &block)
       results = []
-      current = -1
       exception = nil
 
       in_threads(options) do
         # as long as there are more items, work on one of them
         loop do
           break if exception
+          item, index = items.next
+          break unless index
 
-          index = Thread.exclusive{ current+=1 }
-          break if index >= items.size
-
-          with_instrumentation items[index], index, options do
-            begin
-              results[index] = call_with_index(items, index, options, &block)
-            rescue Exception => e
-              exception = e
-              break
+          begin
+            results[index] = with_instrumentation item, index, options do
+              call_with_index(item, index, options, &block)
             end
+          rescue StandardError => e
+            exception = e
+            break
           end
         end
       end
@@ -202,25 +250,32 @@ module Parallel
 
     def work_in_processes(items, options, &blk)
       workers = create_workers(items, options, &blk)
-      current_index = -1
       results = []
       exception = nil
-      kill_on_ctrl_c(workers.map(&:pid), options[:kill_on_ctrl_c]) do
-        in_threads(options) do |i|
+
+      kill_on_ctrl_c(workers.map(&:pid), options) do
+        in_threads(options[:count]) do |i|
           worker = workers[i]
+          worker.thread = Thread.current
 
           begin
             loop do
               break if exception
-              index = Thread.exclusive{ current_index += 1 }
-              break if index >= items.size
+              item, index = items.next
+              break unless index
 
-              output = with_instrumentation items[index], index, options do
-                worker.work(index)
+              output = with_instrumentation item, index, options do
+                worker.work(items.pack(item, index))
               end
 
               if ExceptionWrapper === output
                 exception = output.exception
+                if Parallel::Kill === exception
+                  (workers - [worker]).each do |w|
+                    kill_that_thing!(w.thread)
+                    kill_that_thing!(w.pid)
+                  end
+                end
               else
                 results[index] = output
               end
@@ -272,10 +327,11 @@ module Parallel
 
     def process_incoming_jobs(read, write, items, options, &block)
       while !read.eof?
-        index = Marshal.load(read)
+        data = Marshal.load(read)
+        item, index = items.unpack(data)
         result = begin
-          call_with_index(items, index, options, &block)
-        rescue Exception => e
+          call_with_index(item, index, options, &block)
+        rescue StandardError => e
           ExceptionWrapper.new(e)
         end
         Marshal.dump(result, write)
@@ -283,17 +339,19 @@ module Parallel
     end
 
     def wait_for_threads(threads)
-      threads.compact.each do |t|
+      interrupted = threads.compact.map do |t|
         begin
           t.join
-        rescue Interrupt
-          # thread died, do not stop other threads
+          nil
+        rescue Interrupt => e
+          e # thread died, do not stop other threads
         end
-      end
+      end.compact
+      raise interrupted.first if interrupted.first
     end
 
     def handle_exception(exception, results)
-      return nil if exception.class == Parallel::Break
+      return nil if [Parallel::Break, Parallel::Kill].include? exception.class
       raise exception if exception
       results
     end
@@ -310,25 +368,46 @@ module Parallel
     end
 
     # kill all these pids or threads if user presses Ctrl+c
-    def kill_on_ctrl_c(things, kill_them=true)
-      if defined?(@to_be_killed) && @to_be_killed
-        @to_be_killed << things
-      else
-        @to_be_killed = [things]
-        if kill_them then
-          Signal.trap :SIGINT do
-            if @to_be_killed.any?
+    def kill_on_ctrl_c(things, options)
+      if options.fetch(:kill_on_interrupt_signal, true) then
+        begin
+          @to_be_killed ||= []
+          old_interrupt = nil
+
+          if @to_be_killed.empty?
+            old_interrupt = trap_interrupt do
               $stderr.puts 'Parallel execution interrupted, exiting ...'
               @to_be_killed.flatten.compact.each { |thing| kill_that_thing!(thing) }
             end
-            exit 1 # Quit with 'failed' signal
           end
-        end
 
+          @to_be_killed << things
+
+          yield
+        ensure
+          @to_be_killed.pop # free threads for GC and do not kill pids that could be used for new processes
+          restore_interrupt(old_interrupt) if @to_be_killed.empty?
+        end
       end
-      yield
-    ensure
-      @to_be_killed.pop # free threads for GC and do not kill pids that could be used for new processes
+    end
+
+    def trap_interrupt
+      old = Signal.trap INTERRUPT_SIGNAL, 'IGNORE'
+
+      Signal.trap INTERRUPT_SIGNAL do
+        yield
+        if old == "DEFAULT"
+          raise Interrupt
+        else
+          old.call
+        end
+      end
+
+      old
+    end
+
+    def restore_interrupt(old)
+      Signal.trap INTERRUPT_SIGNAL, old
     end
 
     def kill_that_thing!(thing)
@@ -344,24 +423,25 @@ module Parallel
       end
     end
 
-    def call_with_index(array, index, options, &block)
-      args = [array[index]]
+    def call_with_index(item, index, options, &block)
+      args = [item]
       args << index if options[:with_index]
-      if options[:preserve_results] == false
+      if options[:return_results]
         block.call(*args)
-        nil # avoid GC overhead of passing large results around
       else
         block.call(*args)
+        nil # avoid GC overhead of passing large results around
       end
     end
 
     def with_instrumentation(item, index, options)
       on_start = options[:start]
       on_finish = options[:finish]
-      on_start.call(item, index) if on_start
-      yield
+      options[:mutex].synchronize { on_start.call(item, index) } if on_start
+      result = yield
+      result unless options[:preserve_results] == false
     ensure
-      on_finish.call(item, index) if on_finish
+      options[:mutex].synchronize { on_finish.call(item, index, result) } if on_finish
     end
   end
 end

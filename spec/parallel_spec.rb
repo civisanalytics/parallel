@@ -29,10 +29,6 @@ describe Parallel do
         (1..999).should include(Parallel.processor_count)
       end
     end
-
-    it "defaults to 1 if we don't know better" do
-      `ruby spec/cases/host_os_override_processor_count.rb 2>/dev/null`.to_i.should == 1
-    end
   end
 
   describe ".physical_processor_count" do
@@ -74,24 +70,25 @@ describe Parallel do
     it "kills the processes when the main process gets killed through ctrl+c" do
       time_taken{
         lambda{
-          t = Thread.new { `ruby spec/cases/parallel_start_and_kill.rb PROCESS` }
+          t = Thread.new { `ruby spec/cases/parallel_start_and_kill.rb PROCESS 2>&1` }
           sleep 1
           kill_process_with_name("spec/cases/parallel_start_and_kill.rb") #simulates Ctrl+c
           sleep 1
-          puts t.value
         }.should_not change{`ps`.split("\n").size}
       }.should <= 3
     end
 
     it "kills the threads when the main process gets killed through ctrl+c" do
+      result = nil
       time_taken{
         lambda{
-          Thread.new { `ruby spec/cases/parallel_start_and_kill.rb THREAD` }
+          Thread.new { result = `ruby spec/cases/parallel_start_and_kill.rb THREAD 2>&1 && echo FAILED` }
           sleep 1
           kill_process_with_name("spec/cases/parallel_start_and_kill.rb") #simulates Ctrl+c
           sleep 1
         }.should_not change{`ps`.split("\n").size}
       }.should <= 3
+      result.should_not include "FAILED"
     end
 
     it "does not kill anything on ctrl+c when everything has finished" do
@@ -104,6 +101,20 @@ describe Parallel do
         result.scan(/I finished/).size.should == 3
         result.should_not include("Parallel execution interrupted")
       end.should <= 4
+    end
+
+    it "preserves original intrrupts" do
+      t = Thread.new { `ruby spec/cases/double_interrupt.rb 2>&1 && echo FIN` }
+      sleep 2
+      kill_process_with_name("spec/cases/double_interrupt.rb") #simulates Ctrl+c
+      sleep 1
+      result = t.value
+      result.should include("YES")
+      result.should include("FIN")
+    end
+
+    it "restores original intrrupts" do
+      `ruby spec/cases/after_interrupt.rb 2>&1`.should == "DEFAULT\n"
     end
 
     it "saves time" do
@@ -121,7 +132,9 @@ describe Parallel do
     end
 
     it 'can handle to high fork rate' do
-      `ruby spec/cases/parallel_high_fork_rate.rb`.should == 'OK'
+      unless RbConfig::CONFIG["target_os"] =~ /darwin1/
+        `ruby spec/cases/parallel_high_fork_rate.rb`.should == 'OK'
+      end
     end
 
     it 'does not leave processes behind while running' do
@@ -228,10 +241,10 @@ describe Parallel do
 
     it "notifies when an item of work is completed by a worker process" do
       monitor = double('monitor', :call => nil)
-      monitor.should_receive(:call).once.with(:first, 0)
-      monitor.should_receive(:call).once.with(:second, 1)
-      monitor.should_receive(:call).once.with(:third, 2)
-      Parallel.map([:first, :second, :third], :finish => monitor, :in_processes => 3) {}
+      monitor.should_receive(:call).once.with(:first, 0, 123)
+      monitor.should_receive(:call).once.with(:second, 1, 123)
+      monitor.should_receive(:call).once.with(:third, 2, 123)
+      Parallel.map([:first, :second, :third], :finish => monitor, :in_processes => 3) { 123 }
     end
 
     it "notifies when an item of work is dispatched to a threaded worker" do
@@ -244,10 +257,10 @@ describe Parallel do
 
     it "notifies when an item of work is completed by a threaded worker" do
       monitor = double('monitor', :call => nil)
-      monitor.should_receive(:call).once.with(:first, 0)
-      monitor.should_receive(:call).once.with(:second, 1)
-      monitor.should_receive(:call).once.with(:third, 2)
-      Parallel.map([:first, :second, :third], :finish => monitor, :in_threads => 3) {}
+      monitor.should_receive(:call).once.with(:first, 0, 123)
+      monitor.should_receive(:call).once.with(:second, 1, 123)
+      monitor.should_receive(:call).once.with(:third, 2, 123)
+      Parallel.map([:first, :second, :third], :finish => monitor, :in_threads => 3) { 123 }
     end
 
     it "spits out a useful error when a worker dies before read" do
@@ -256,6 +269,24 @@ describe Parallel do
 
     it "spits out a useful error when a worker dies before write" do
       `ruby spec/cases/map_with_killed_worker_before_write.rb 2>&1`.should include "DEAD"
+    end
+
+    it "raises DeadWorker when using exit so people learn to not kill workers and do not crash main process" do
+      `ruby spec/cases/exit_in_process.rb 2>&1`.should include "Yep, DEAD"
+    end
+
+    it "can be killed instantly" do
+      result = `ruby spec/cases/parallel_kill.rb 2>&1`
+      result.should == "DEAD\nWorks nil\n"
+    end
+
+    it "synchronizes :start and :finish" do
+      out = `ruby spec/cases/synchronizes_start_and_finish.rb`
+      %w{a b c}.each {|letter|
+        out.sub! letter.downcase * 10, 'OK'
+        out.sub! letter.upcase * 10, 'OK'
+      }
+      out.should == "OK\n" * 6
     end
   end
 
@@ -284,18 +315,84 @@ describe Parallel do
       `ruby spec/cases/each.rb`.should == 'a b c d'
     end
 
+    it "passes result to :finish callback :in_processes`" do
+      monitor = double('monitor', :call => nil)
+      monitor.should_receive(:call).once.with(:first, 0, 123)
+      monitor.should_receive(:call).once.with(:second, 1, 123)
+      monitor.should_receive(:call).once.with(:third, 2, 123)
+      Parallel.each([:first, :second, :third], :finish => monitor, :in_processes => 3) { 123 }
+    end
+
+    it "passes result to :finish callback :in_threads`" do
+      monitor = double('monitor', :call => nil)
+      monitor.should_receive(:call).once.with(:first, 0, 123)
+      monitor.should_receive(:call).once.with(:second, 1, 123)
+      monitor.should_receive(:call).once.with(:third, 2, 123)
+      Parallel.each([:first, :second, :third], :finish => monitor, :in_threads => 3) { 123 }
+    end
+
     it "does not use marshal_dump" do
       `ruby spec/cases/no_dump_with_each.rb 2>&1`.should == 'no dump for resultno dump for each'
     end
 
     it "does not slow down with lots of GC work in threads" do
-      Benchmark.realtime { `ruby spec/cases/no_gc_with_each.rb 2>&1` }.should <= 10
+      Benchmark.realtime { `ruby spec/cases/no_gc_with_each.rb 2>&1` }.should <= (ENV["TRAVIS"] ? 15 : 10)
+    end
+
+    it "can modify in-place" do
+      `ruby spec/cases/each_in_place.rb`.should == 'ab'
     end
   end
 
   describe ".each_with_index" do
     it "yields object and index" do
       ["a0b1", "b1a0"].should include `ruby spec/cases/each_with_index.rb 2>&1`
+    end
+  end
+
+  describe "progress" do
+    it "shows" do
+      `ruby spec/cases/progress.rb`.sub(/=+/, '==').strip.should == "Doing stuff: |==|"
+    end
+
+    it "works with :finish" do
+      `ruby spec/cases/progress_with_finish.rb`.strip.sub(/=+/, '==').gsub(/\n+/,"\n").should == "Doing stuff: |==|\n100"
+    end
+  end
+
+  ["lambda", "queue"].each do |thing|
+    describe "lambdas" do
+      let(:result) { "ITEM-1\nITEM-2\nITEM-3\n" }
+
+      it "runs in threads" do
+        `ruby spec/cases/with_#{thing}.rb THREADS`.should == result
+      end
+
+      it "runs in processs" do
+        `ruby spec/cases/with_#{thing}.rb PROCESSES`.should == result
+      end
+
+      it "refuses to use progress" do
+        expect {
+          Parallel.map(lambda{}, :progress => "xxx"){ raise "Ooops" }
+        }.to raise_error("Progressbar and producers don't mix")
+      end
+    end
+  end
+
+  describe "GC" do
+    def normalize(result)
+      result.sub(/\{(.*)\}/, "\\1").split(", ").reject { |x| x =~ /^(Hash|Array|String)=>(1|-1)$/ }
+    end
+
+    it "does not leak memory in processes" do
+      result = `ruby spec/cases/profile_memroy.rb processes 2>&1`.strip.split("\n").last
+      normalize(result).should == []
+    end
+
+    it "does not leak memory in threads" do
+      result = `ruby spec/cases/profile_memroy.rb threads 2>&1`.strip.split("\n").last
+      normalize(result).should == []
     end
   end
 end

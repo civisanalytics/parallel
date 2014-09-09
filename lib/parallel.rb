@@ -388,6 +388,8 @@ module Parallel
           @to_be_killed.pop # free threads for GC and do not kill pids that could be used for new processes
           restore_interrupt(old_interrupt) if @to_be_killed.empty?
         end
+      else
+        yield
       end
     end
 
